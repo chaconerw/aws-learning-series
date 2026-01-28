@@ -4,12 +4,8 @@
       "eventSource": "aws:s3",
       "eventName": "ObjectCreated:Put",
       "s3": {
-        "bucket": {
-          "name": "mi-bucket-lambda"
-        },
-        "object": {
-          "key": "uploads/foto-ejemplo.jpg"
-        }
+        "bucket": { "name": "bucket-mrrobot" },
+        "object": { "key": "uploads/s3.jpg" }
       }
     }
   ]
