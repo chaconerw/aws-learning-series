@@ -19,6 +19,11 @@ def lambda_handler(event, context):
     bucket = record['s3']['bucket']['name']
     key = urllib.parse.unquote_plus(record['s3']['object']['key'])
     
+    # Ignorar "carpetas" (prefijos) que terminan en /
+    if key.endswith('/'):
+        print(f"Ignorado - es un prefijo/carpeta: {key}")
+        return {'statusCode': 200, 'body': 'Ignorado - carpeta/prefijo'}
+    
     # Solo procesar archivos en uploads/
     if not key.startswith('uploads/'):
         print(f"Ignorado - no está en uploads/: {key}")
@@ -26,6 +31,12 @@ def lambda_handler(event, context):
             'statusCode': 200,
             'body': 'Archivo ignorado - no está en carpeta uploads/'
         }
+    
+    # Solo aceptar extensiones de imagen soportadas por Rekognition
+    allowed = ('.jpg', '.jpeg', '.png')
+    if not key.lower().endswith(allowed):
+        print(f"Ignorado - no es imagen soportada: {key}")
+        return {'statusCode': 200, 'body': 'Ignorado - formato no soportado'}
     
     print(f"Analizando imagen: {bucket}/{key}")
     
@@ -39,8 +50,8 @@ def lambda_handler(event, context):
                 'Name': key
             }
         },
-        MaxLabels=10,           # Máximo 10 etiquetas
-        MinConfidence=70        # Solo si tiene 70%+ de confianza
+        MaxLabels=10,
+        MinConfidence=70
     )
     
     labels = []
@@ -53,7 +64,7 @@ def lambda_handler(event, context):
     print(f"Objetos detectados: {labels}")
     
     # ============================================
-    # 2. DETECTAR TEXTO EN LA IMAGEN (Opcional)
+    # 2. DETECTAR TEXTO EN LA IMAGEN
     # ============================================
     text_response = rekognition.detect_text(
         Image={
@@ -66,7 +77,7 @@ def lambda_handler(event, context):
     
     textos = []
     for text in text_response['TextDetections']:
-        if text['Type'] == 'LINE':  # Solo líneas completas
+        if text['Type'] == 'LINE':
             textos.append({
                 'texto': text['DetectedText'],
                 'confianza': round(text['Confidence'], 2)
@@ -75,7 +86,7 @@ def lambda_handler(event, context):
     print(f"Texto detectado: {textos}")
     
     # ============================================
-    # 3. DETECTAR CARAS (Opcional)
+    # 3. DETECTAR CARAS
     # ============================================
     faces_response = rekognition.detect_faces(
         Image={
@@ -84,12 +95,11 @@ def lambda_handler(event, context):
                 'Name': key
             }
         },
-        Attributes=['ALL']  # Detectar emociones, edad, etc.
+        Attributes=['ALL']
     )
     
     caras = []
     for face in faces_response['FaceDetails']:
-        # Obtener la emoción principal
         emociones = face.get('Emotions', [])
         emocion_principal = None
         if emociones:
@@ -109,12 +119,10 @@ def lambda_handler(event, context):
     # ============================================
     # 4. GUARDAR RESULTADOS EN S3
     # ============================================
-    # Crear nombre del archivo de resultados
     filename = key.split('/')[-1]
     filename_sin_extension = filename.rsplit('.', 1)[0]
     resultado_key = f"resultados/{filename_sin_extension}_analisis.json"
     
-    # Preparar el JSON con todos los resultados
     resultado = {
         'archivo_analizado': key,
         'bucket': bucket,
@@ -126,7 +134,6 @@ def lambda_handler(event, context):
         }
     }
     
-    # Guardar en S3
     s3.put_object(
         Bucket=bucket,
         Key=resultado_key,
