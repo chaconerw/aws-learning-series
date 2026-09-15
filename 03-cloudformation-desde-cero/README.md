@@ -10,6 +10,16 @@ Después actualizamos la infraestructura con un **Change Set**, provocamos un **
 
 ## Arquitectura
 
+![Arquitectura del laboratorio](docs/architecture/arquitectura.png)
+
+> La VPC, las subnets, el Internet Gateway y el NAT Gateway **ya existen**. La plantilla crea el Application Load Balancer, el Target Group, los Security Groups, el rol IAM y las instancias EC2.
+
+### Los 3 pasos del laboratorio
+
+![Los 3 pasos: plantilla inicial, Change Set y error con rollback](docs/architecture/arquitectura-3-pasos.png)
+
+### Flujo
+
 ```
 Tu computadora (IP /32)
         │ HTTP :80
