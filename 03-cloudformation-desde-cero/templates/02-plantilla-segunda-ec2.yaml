@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  My IT Mentors - CloudFormation desde cero sobre una VPC existente.
+  Crea un Application Load Balancer publico restringido a una IP /32
+  y una EC2 privada administrada con AWS Systems Manager Session Manager.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+  NombreProyecto:
+    Type: String
+    Default: myit-cfn
+    Description: Nombre corto para identificar los recursos del laboratorio.
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]{2,20}$'
+    ConstraintDescription: >-
+      Usa entre 3 y 21 caracteres y comienza con una letra.
+  Ambiente:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Ambiente del despliegue.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC existente donde se desplegara la aplicacion.
+  SubnetPublicaA:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Primera subnet publica para el Application Load Balancer.
+  SubnetPublicaB:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Segunda subnet publica, ubicada en otra zona de disponibilidad,
+      para el Application Load Balancer.
+  SubnetPrivadaA:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Subnet privada donde se creara la primera instancia EC2.
+  SubnetPrivadaB:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Segunda subnet privada.
+      Se utilizara posteriormente durante el Change Set del video.
+  IpPermitida:
+    Type: String
+    Description: >-
+      Ingresa tu IPv4 publica en formato CIDR /32.
+      Ejemplo: 203.0.113.10/32.
+      Esta sera la unica IP autorizada para acceder
+      al Application Load Balancer por HTTP puerto 80.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/32$'
+    ConstraintDescription: >-
+      Debe utilizar formato IPv4/32.
+      Ejemplo: 203.0.113.10/32.
+  TipoInstancia:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+    Description: Tipo de instancia EC2 utilizada en el laboratorio.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >-
+      AMI publica mas reciente de Amazon Linux 2023 x86_64.
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # SECURITY GROUP DEL APPLICATION LOAD BALANCER
+  # ----------------------------------------------------------
+  SecurityGroupALB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Cambio intencional para demostrar Replacement en el Change Set.
+      # GroupDescription requiere reemplazo del Security Group.
+      GroupDescription: >-
+        Permite HTTP al ALB unicamente desde la IP publica autorizada 1.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP solamente desde la IP del estudiante
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref IpPermitida
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${NombreProyecto}-${Ambiente}-sg-alb'
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  # ----------------------------------------------------------
+  # SECURITY GROUP DE LA INSTANCIA EC2
+  # ----------------------------------------------------------
+  SecurityGroupServidor:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Permite HTTP a la EC2 solamente desde
+        el Security Group del Application Load Balancer.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP solamente desde el ALB
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref SecurityGroupALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${NombreProyecto}-${Ambiente}-sg-web'
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  # ----------------------------------------------------------
+  # IAM ROLE PARA LA INSTANCIA EC2
+  # ----------------------------------------------------------
+  RolServidorSSM:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Tags:
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  # ----------------------------------------------------------
+  # INSTANCE PROFILE PARA ASOCIAR EL ROLE A LA EC2
+  # ----------------------------------------------------------
+  PerfilServidorSSM:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref RolServidorSSM
+
+  # ----------------------------------------------------------
+  # INSTANCIA EC2 PRIVADA
+  # ----------------------------------------------------------
+  ServidorWebA:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref TipoInstancia
+      IamInstanceProfile: !Ref PerfilServidorSSM
+      # Exigimos IMDSv2
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref SecurityGroupServidor
+          SubnetId: !Ref SubnetPrivadaA
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          mkdir -p /var/www/html
+
+          # --------------------------------------------------
+          # Obtener token de IMDSv2
+          # --------------------------------------------------
+          TOKEN=$(curl -sS -X PUT \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+            http://169.254.169.254/latest/api/token)
+          INSTANCE_ID=$(curl -sS \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          AZ=$(curl -sS \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/availability-zone)
+          PRIVATE_IP=$(curl -sS \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          # --------------------------------------------------
+          # Crear pagina web
+          # --------------------------------------------------
+          cat > /var/www/html/index.html <<EOF
+          <!doctype html>
+          <html lang="es">
+          <head>
+            <meta charset="utf-8">
+            <meta
+              name="viewport"
+              content="width=device-width,initial-scale=1">
+            <title>
+              CloudFormation - My IT Mentors
+            </title>
+            <style>
+              body {
+                font-family: Arial, sans-serif;
+                background:#0f172a;
+                color:#e2e8f0;
+                display:grid;
+                place-items:center;
+                min-height:100vh;
+                margin:0;
+              }
+              main {
+                width:min(760px,90%);
+                background:#1e293b;
+                padding:42px;
+                border-radius:18px;
+                box-shadow:0 20px 60px #020617;
+              }
+              h1 {
+                color:#38bdf8;
+                margin-top:0;
+              }
+              .dato {
+                background:#0f172a;
+                padding:12px 16px;
+                border-radius:8px;
+                margin:10px 0;
+              }
+              .ok {
+                color:#86efac;
+                font-weight:bold;
+              }
+            </style>
+          </head>
+          <body>
+            <main>
+              <p>MY IT MENTORS</p>
+              <h1>
+                AWS CloudFormation funcionando
+              </h1>
+              <p class="ok">
+                La solicitud llego al ALB
+                y fue procesada por una EC2 privada.
+              </p>
+              <div class="dato">
+                <strong>Servidor:</strong> A
+              </div>
+              <div class="dato">
+                <strong>Proyecto:</strong> ${NombreProyecto}
+              </div>
+              <div class="dato">
+                <strong>Ambiente:</strong> ${Ambiente}
+              </div>
+              <div class="dato">
+                <strong>Instance ID:</strong> $INSTANCE_ID
+              </div>
+              <div class="dato">
+                <strong>Zona:</strong> $AZ
+              </div>
+              <div class="dato">
+                <strong>IP privada:</strong> $PRIVATE_IP
+              </div>
+              <div class="dato">
+                <strong>IP publica en la EC2:</strong> Ninguna
+              </div>
+            </main>
+          </body>
+          </html>
+          EOF
+
+          # --------------------------------------------------
+          # Crear servicio web
+          # --------------------------------------------------
+          cat > /etc/systemd/system/myit-web.service <<'EOF'
+          [Unit]
+          Description=Servidor web de laboratorio My IT Mentors
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www/html
+          Restart=always
+          RestartSec=3
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now myit-web
+          systemctl enable --now amazon-ssm-agent || true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NombreProyecto}-${Ambiente}-web-a'
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  ServidorWebB:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref TipoInstancia
+      IamInstanceProfile: !Ref PerfilServidorSSM
+      # Exigimos IMDSv2
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref SecurityGroupServidor
+          SubnetId: !Ref SubnetPrivadaB
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          mkdir -p /var/www/html
+
+          # --------------------------------------------------
+          # Obtener token de IMDSv2
+          # --------------------------------------------------
+          TOKEN=$(curl -sS -X PUT \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+            http://169.254.169.254/latest/api/token)
+          INSTANCE_ID=$(curl -sS \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          AZ=$(curl -sS \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/availability-zone)
+          PRIVATE_IP=$(curl -sS \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          # --------------------------------------------------
+          # Crear pagina web
+          # --------------------------------------------------
+          cat > /var/www/html/index.html <<EOF
+          <!doctype html>
+          <html lang="es">
+          <head>
+            <meta charset="utf-8">
+            <meta
+              name="viewport"
+              content="width=device-width,initial-scale=1">
+            <title>
+              CloudFormation - My IT Mentors
+            </title>
+            <style>
+              body {
+                font-family: Arial, sans-serif;
+                background:#0f172a;
+                color:#e2e8f0;
+                display:grid;
+                place-items:center;
+                min-height:100vh;
+                margin:0;
+              }
+              main {
+                width:min(760px,90%);
+                background:#1e293b;
+                padding:42px;
+                border-radius:18px;
+                box-shadow:0 20px 60px #020617;
+              }
+              h1 {
+                color:#38bdf8;
+                margin-top:0;
+              }
+              .dato {
+                background:#0f172a;
+                padding:12px 16px;
+                border-radius:8px;
+                margin:10px 0;
+              }
+              .ok {
+                color:#86efac;
+                font-weight:bold;
+              }
+            </style>
+          </head>
+          <body>
+            <main>
+              <p>MY IT MENTORS</p>
+              <h1>
+                AWS CloudFormation funcionando
+              </h1>
+              <p class="ok">
+                La solicitud llego al ALB
+                y fue procesada por una EC2 privada.
+              </p>
+              <div class="dato">
+                <strong>Servidor:</strong> B
+              </div>
+              <div class="dato">
+                <strong>Proyecto:</strong> ${NombreProyecto}
+              </div>
+              <div class="dato">
+                <strong>Ambiente:</strong> ${Ambiente}
+              </div>
+              <div class="dato">
+                <strong>Instance ID:</strong> $INSTANCE_ID
+              </div>
+              <div class="dato">
+                <strong>Zona:</strong> $AZ
+              </div>
+              <div class="dato">
+                <strong>IP privada:</strong> $PRIVATE_IP
+              </div>
+              <div class="dato">
+                <strong>IP publica en la EC2:</strong> Ninguna
+              </div>
+            </main>
+          </body>
+          </html>
+          EOF
+
+          # --------------------------------------------------
+          # Crear servicio web
+          # --------------------------------------------------
+          cat > /etc/systemd/system/myit-web.service <<'EOF'
+          [Unit]
+          Description=Servidor web de laboratorio My IT Mentors
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www/html
+          Restart=always
+          RestartSec=3
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now myit-web
+          systemctl enable --now amazon-ssm-agent || true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NombreProyecto}-${Ambiente}-web-b'
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  # ----------------------------------------------------------
+  # TARGET GROUP
+  # ----------------------------------------------------------
+  GrupoDestinos:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Targets:
+        - Id: !Ref ServidorWebA
+          Port: 80
+        - Id: !Ref ServidorWebB
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub '${NombreProyecto}-${Ambiente}-tg'
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  # ----------------------------------------------------------
+  # APPLICATION LOAD BALANCER
+  # ----------------------------------------------------------
+  Balanceador:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref SecurityGroupALB
+      Subnets:
+        - !Ref SubnetPublicaA
+        - !Ref SubnetPublicaB
+      Tags:
+        - Key: Name
+          Value: !Sub '${NombreProyecto}-${Ambiente}-alb'
+        - Key: Project
+          Value: !Ref NombreProyecto
+        - Key: Environment
+          Value: !Ref Ambiente
+
+  # ----------------------------------------------------------
+  # LISTENER HTTP DEL ALB
+  # ----------------------------------------------------------
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Balanceador
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GrupoDestinos
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+  UrlAplicacion:
+    Description: URL HTTP del Application Load Balancer
+    Value: !Sub 'http://${Balanceador.DNSName}'
+  DNSBalanceador:
+    Description: DNS generado por AWS para el ALB
+    Value: !GetAtt Balanceador.DNSName
+  InstanciaAId:
+    Description: ID de la instancia EC2 privada A
+    Value: !Ref ServidorWebA
+  InstanciaBId:
+    Description: ID de la instancia EC2 privada B
+    Value: !Ref ServidorWebB
+  SecurityGroupALBId:
+    Description: Security Group del Application Load Balancer
+    Value: !Ref SecurityGroupALB
+  SecurityGroupServidorId:
+    Description: Security Group de las instancias EC2 privadas
+    Value: !Ref SecurityGroupServidor
